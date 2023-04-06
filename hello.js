@@ -2,6 +2,8 @@
 const aircode = require("aircode");
 const lark = require("@larksuiteoapi/node-sdk");
 var axios = require("axios");
+const https =  require("https");
+const EventSource = require('eventsource');
 const EventDB = aircode.db.table("event");
 const MsgTable = aircode.db.table("msg"); // 用于保存历史会话的表
 
@@ -12,35 +14,19 @@ const FEISHU_BOTNAME = process.env.BOTNAME || ""; // 飞书机器人的名字
 const OPENAI_KEY = process.env.KEY || ""; // OpenAI 的 Key
 const OPENAI_MODEL = process.env.MODEL || "gpt-3.5-turbo"; // 使用的模型
 const OPENAI_MAX_TOKEN = process.env.MAX_TOKEN || 1024; // 最大 token 的值
+const SERVER_HOST = process.env.SERVER_HOST || "127.0.0.1"; // 服务端地址
+const SOCKET_SERVER_HOST = process.env.SOCKET_SERVER_HOST || "127.0.0.1"; // 服务端socker地址
+
 
 const client = new lark.Client({
-  appId: FEISHU_APP_ID,
-  appSecret: FEISHU_APP_SECRET,
-  disableTokenCache: false,
+    appId: FEISHU_APP_ID,
+    appSecret: FEISHU_APP_SECRET,
+    disableTokenCache: false
 });
 
 // 日志辅助函数，请贡献者使用此函数打印关键日志
 function logger(param) {
   console.debug(`[CF]`, param);
-}
-
-// 回复消息
-async function reply(messageId, content) {
-  try{
-    return await client.im.message.reply({
-    path: {
-      message_id: messageId,
-    },
-    data: {
-      content: JSON.stringify({
-        text: content,
-      }),
-      msg_type: "text",
-    },
-  });
-  } catch(e){
-    logger("send message to feishu error",e,messageId,content);
-  }
 }
 
 
@@ -63,6 +49,7 @@ async function buildConversation(sessionId, question) {
 
 // 保存用户会话
 async function saveConversation(sessionId, question, answer) {
+  logger("sid:" + sessionId + " que: " + question + " ans:" + answer)
   const msgSize =  question.length + answer.length
   const result = await MsgTable.save({
     sessionId,
@@ -99,6 +86,13 @@ async function discardConversation(sessionId) {
 
 // 清除历史会话
 async function clearConversation(sessionId) {
+  try {
+    await axios.get(`${SERVER_HOST}/chat/clear?uid=${sessionId}`).then(response => {
+        console('/chat/clear:' + response.data)
+    })
+  } catch (error) {
+    logger(error);
+  }
   return await MsgTable.where({ sessionId }).delete();
 }
 
@@ -135,41 +129,84 @@ async function cmdClear(sessionId, messageId) {
   await reply(messageId, "✅记忆已清除");
 }
 
-// 通过 OpenAI API 获取回复
-async function getOpenAIReply(prompt) {
-
-  var data = JSON.stringify({
-    model: OPENAI_MODEL,
-    messages: prompt
-  });
-
-  var config = {
-    method: "post",
-    maxBodyLength: Infinity,
-    url: "https://api.openai.com/v1/chat/completions",
-    headers: {
-      Authorization: `Bearer ${OPENAI_KEY}`,
-      "Content-Type": "application/json",
-    },
-    data: data,
-    timeout: 50000
-  };
-
+// 回复消息
+async function reply(messageId, content) {
+  logger("content" + content)
   try{
-      const response = await axios(config);
-    
-      if (response.status === 429) {
-        return '问题太多了，我有点眩晕，请稍后再试';
-      }
-      // 去除多余的换行
-      return response.data.choices[0].message.content.replace("\n\n", "");
-    
-  }catch(e){
-     logger(e.response.data)
-     return "问题太难了 出错了. (uДu〃).";
+    return await client.im.message.reply({
+        path: {
+          message_id: messageId,
+        },
+        data: {
+          content: JSON.stringify({
+            text: content,
+          }),
+          msg_type: "text",
+        },
+    });
+  } catch(e){
+    logger("send message to feishu error",e,messageId,content);
   }
-
 }
+
+
+async function getOpenAIReply(messageId, sessionId, prompt) {
+  const encodedPrompt = encodeURIComponent(prompt);
+  const eventSource = new EventSource(`${SOCKET_SERVER_HOST}/chat/v1?message=${encodedPrompt}`, {
+    headers: {
+      "uid": sessionId
+    }
+    // },
+    // // 使用证书配置
+    // withCredentials: true,
+    // rejectUnauthorized: false
+  });
+   logger("prompt: " + prompt);
+  let sse;
+  return new Promise((resolveFn, rejectFn)  => {
+   new Promise((resolve, reject) => {
+       let msg =""
+        eventSource.onopen = (event) => {
+          logger("onopen", event.readyState, event.target);
+          sse = event.target;
+          logger("SSE connection established");
+        };
+        eventSource.onmessage = (event) => {
+          if (event.data == "[DONE]") {
+            if (sse) {
+              sse.close();
+            }
+            // logger("msg rs: " + msg)
+            resolve(msg);
+          }
+          const response = JSON.parse(event.data);
+          if (response.content == null || response.content == 'null') {
+            return;
+          }
+          msg += response.content;
+          // logger("msg: " + msg)
+          // reply(messageId, response.content);
+        };
+        eventSource.onerror = (event) => {
+            logger("onerror" + event);
+            if (event.readyState === EventSource.CLOSED) {
+                logger('connection is closed');
+            } else {
+                logger("Error occured", event);
+            }
+            event.target.close();
+        };
+        eventSource.addEventListener("customEventName", (event) => {
+           logger("Message id is " + event.lastEventId);
+        });
+    }).then((res) =>{
+        logger("result " + res);
+        resolveFn(res)
+    });
+  });
+}
+
+
 
 // 自检函数
 async function doctor() {
@@ -216,27 +253,6 @@ async function doctor() {
     };
   }
 
-  if (OPENAI_KEY === "") {
-    return {
-      code: 1,
-      message: {
-        zh_CN: "你没有配置 OpenAI 的 Key，请检查 & 部署后重试",
-        en_US: "Here is no OpenAI Key, please check & re-Deploy & call again",
-      },
-    };
-  }
-
-  if (!OPENAI_KEY.startsWith("sk-")) {
-    return {
-      code: 1,
-      message: {
-        zh_CN:
-          "你配置的 OpenAI Key 是错误的，请检查后重试。OpenAI 的 KEY 以 sk- 开头。",
-        en_US:
-          "Your OpenAI Key is Wrong, Please Check and call again. FeiShu APPID must Start with cli",
-      },
-    };
-  }
   return {
     code: 0,
     message: {
@@ -255,6 +271,7 @@ async function doctor() {
   };
 }
 
+
 async function handleReply(userInput, sessionId, messageId, eventId) {
   const question = userInput.text.replace("@_user_1", "");
   logger("question: " + question);
@@ -263,7 +280,7 @@ async function handleReply(userInput, sessionId, messageId, eventId) {
     return await cmdProcess({action, sessionId, messageId});
   }
   const prompt = await buildConversation(sessionId, question);
-  const openaiResponse = await getOpenAIReply(prompt);
+  const openaiResponse  = await getOpenAIReply(messageId, sessionId, question);
   await saveConversation(sessionId, question, openaiResponse)
   await reply(messageId, openaiResponse);
 
@@ -322,6 +339,7 @@ module.exports = async function (params, context) {
         logger("skip and reply not support");
         return { code: 0 };
       }
+      logger("p2p request")
       // 是文本消息，直接回复
       const userInput = JSON.parse(params.event.message.content);
       return await handleReply(userInput, sessionId, messageId, eventId);
